@@ -1,0 +1,213 @@
+-- HUB SOBERANO PDV 2.0 | Fase 1 | Fundação
+-- Modelo: companies (empresa) -> stores (lojas). Usuário entra na empresa via company_members.
+-- Regra: nenhuma tabela de negócio sem company_id e sem RLS.
+
+create schema if not exists private;
+revoke all on schema private from public;
+grant usage on schema private to authenticated;
+
+-- ============ TABELAS ============
+create table public.companies (
+  id uuid primary key default gen_random_uuid(),
+  name text not null check (length(trim(name)) > 0),
+  plan text not null default 'soberano' check (plan in ('basico','profissional','soberano')),
+  created_at timestamptz not null default now(),
+  deleted_at timestamptz
+);
+
+create table public.stores (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id),
+  name text not null check (length(trim(name)) > 0),
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  deleted_at timestamptz
+);
+create index on public.stores (company_id);
+
+create table public.permissions (
+  key text primary key,
+  description text not null
+);
+
+create table public.roles (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id),
+  key text not null,                     -- admin | gerente | operador | custom
+  name text not null,
+  is_system boolean not null default false,
+  unique (company_id, key)
+);
+
+create table public.role_permissions (
+  role_id uuid not null references public.roles(id) on delete cascade,
+  permission_key text not null references public.permissions(key),
+  primary key (role_id, permission_key)
+);
+
+create table public.company_members (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id),
+  user_id uuid not null references auth.users(id),
+  role_id uuid not null references public.roles(id),
+  all_stores boolean not null default true,   -- false = só lojas em member_stores
+  status text not null default 'active' check (status in ('active','suspended')),
+  created_at timestamptz not null default now(),
+  unique (company_id, user_id)
+);
+create index on public.company_members (user_id);
+
+create table public.member_stores (
+  member_id uuid not null references public.company_members(id) on delete cascade,
+  store_id uuid not null references public.stores(id),
+  primary key (member_id, store_id)
+);
+
+create table public.audit_logs (
+  id bigint generated always as identity primary key,
+  company_id uuid not null references public.companies(id),
+  store_id uuid,
+  user_id uuid,
+  action text not null,
+  entity text not null,
+  entity_id text,
+  details jsonb,
+  created_at timestamptz not null default now()
+);
+create index on public.audit_logs (company_id, created_at desc);
+
+-- ============ PERMISSÕES PADRÃO ============
+insert into public.permissions (key, description) values
+ ('company.manage','Editar dados da empresa'),
+ ('stores.manage','Criar e editar lojas'),
+ ('team.manage','Gerenciar usuários, papéis e permissões'),
+ ('audit.read','Ver histórico de atividades'),
+ ('products.read','Ver produtos'),
+ ('products.write','Criar e editar produtos'),
+ ('stock.write','Movimentar e ajustar estoque'),
+ ('sales.create','Realizar vendas (PDV)'),
+ ('sales.cancel','Cancelar vendas'),
+ ('cash.operate','Abrir/fechar caixa, sangria, suprimento'),
+ ('finance.read','Ver financeiro'),
+ ('finance.write','Lançar despesas e contas'),
+ ('reports.read','Ver relatórios e dashboard');
+
+-- ============ FUNÇÕES AUXILIARES (security definer, sem recursão de RLS) ============
+create function private.is_member(p_company uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (
+    select 1 from public.company_members m
+    where m.company_id = p_company and m.user_id = auth.uid() and m.status = 'active');
+$$;
+
+create function private.has_permission(p_company uuid, p_perm text) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (
+    select 1 from public.company_members m
+    join public.role_permissions rp on rp.role_id = m.role_id
+    where m.company_id = p_company and m.user_id = auth.uid()
+      and m.status = 'active' and rp.permission_key = p_perm);
+$$;
+
+create function private.can_access_store(p_store uuid) returns boolean
+language sql stable security definer set search_path = '' as $$
+  select exists (
+    select 1 from public.stores s
+    join public.company_members m on m.company_id = s.company_id
+    where s.id = p_store and m.user_id = auth.uid() and m.status = 'active'
+      and (m.all_stores or exists (
+        select 1 from public.member_stores ms
+        where ms.member_id = m.id and ms.store_id = s.id)));
+$$;
+
+grant execute on all functions in schema private to authenticated;
+
+-- ============ CRIAÇÃO DE EMPRESA (atômica) ============
+create function public.create_company(p_name text, p_store_name text default 'Loja Principal')
+returns uuid language plpgsql security definer set search_path = '' as $$
+declare
+  v_company uuid; v_admin uuid; v_ger uuid; v_op uuid;
+begin
+  if auth.uid() is null then raise exception 'Não autenticado'; end if;
+
+  insert into public.companies (name) values (p_name) returning id into v_company;
+  insert into public.stores (company_id, name) values (v_company, p_store_name);
+
+  insert into public.roles (company_id, key, name, is_system) values (v_company,'admin','Administrador',true) returning id into v_admin;
+  insert into public.roles (company_id, key, name, is_system) values (v_company,'gerente','Gerente',true) returning id into v_ger;
+  insert into public.roles (company_id, key, name, is_system) values (v_company,'operador','Operador',true) returning id into v_op;
+
+  insert into public.role_permissions select v_admin, key from public.permissions;
+  insert into public.role_permissions select v_ger, key from public.permissions
+    where key in ('products.read','products.write','stock.write','sales.create','sales.cancel',
+                  'cash.operate','finance.read','reports.read');
+  insert into public.role_permissions select v_op, key from public.permissions
+    where key in ('products.read','sales.create','cash.operate');
+
+  insert into public.company_members (company_id, user_id, role_id, all_stores)
+    values (v_company, auth.uid(), v_admin, true);
+
+  insert into public.audit_logs (company_id, user_id, action, entity, entity_id)
+    values (v_company, auth.uid(), 'create', 'company', v_company::text);
+  return v_company;
+end $$;
+revoke all on function public.create_company(text,text) from public;
+grant execute on function public.create_company(text,text) to authenticated;
+
+-- ============ RLS ============
+alter table public.companies        enable row level security;
+alter table public.stores           enable row level security;
+alter table public.permissions      enable row level security;
+alter table public.roles            enable row level security;
+alter table public.role_permissions enable row level security;
+alter table public.company_members  enable row level security;
+alter table public.member_stores    enable row level security;
+alter table public.audit_logs       enable row level security;
+
+create policy companies_select on public.companies for select to authenticated
+  using (private.is_member(id));
+create policy companies_update on public.companies for update to authenticated
+  using (private.has_permission(id,'company.manage'))
+  with check (private.has_permission(id,'company.manage'));
+
+create policy stores_select on public.stores for select to authenticated
+  using (private.can_access_store(id));
+create policy stores_insert on public.stores for insert to authenticated
+  with check (private.has_permission(company_id,'stores.manage'));
+create policy stores_update on public.stores for update to authenticated
+  using (private.has_permission(company_id,'stores.manage'))
+  with check (private.has_permission(company_id,'stores.manage'));
+
+create policy permissions_select on public.permissions for select to authenticated using (true);
+
+create policy roles_select on public.roles for select to authenticated
+  using (private.is_member(company_id));
+create policy roles_write on public.roles for all to authenticated
+  using (private.has_permission(company_id,'team.manage') and not is_system)
+  with check (private.has_permission(company_id,'team.manage') and not is_system);
+
+create policy role_perm_select on public.role_permissions for select to authenticated
+  using (exists (select 1 from public.roles r where r.id = role_id and private.is_member(r.company_id)));
+create policy role_perm_write on public.role_permissions for all to authenticated
+  using (exists (select 1 from public.roles r where r.id = role_id and private.has_permission(r.company_id,'team.manage')))
+  with check (exists (select 1 from public.roles r where r.id = role_id and private.has_permission(r.company_id,'team.manage')));
+
+create policy members_select on public.company_members for select to authenticated
+  using (private.is_member(company_id));
+create policy members_write on public.company_members for all to authenticated
+  using (private.has_permission(company_id,'team.manage'))
+  with check (private.has_permission(company_id,'team.manage'));
+
+create policy member_stores_select on public.member_stores for select to authenticated
+  using (exists (select 1 from public.company_members m where m.id = member_id and private.is_member(m.company_id)));
+create policy member_stores_write on public.member_stores for all to authenticated
+  using (exists (select 1 from public.company_members m where m.id = member_id and private.has_permission(m.company_id,'team.manage')))
+  with check (exists (select 1 from public.company_members m where m.id = member_id and private.has_permission(m.company_id,'team.manage')));
+
+-- Auditoria: só leitura para quem tem permissão; ninguém edita/apaga/insere direto.
+create policy audit_select on public.audit_logs for select to authenticated
+  using (private.has_permission(company_id,'audit.read'));
+revoke insert, update, delete on public.audit_logs from authenticated, anon;
+
+-- Anon não acessa nada
+revoke all on all tables in schema public from anon;
